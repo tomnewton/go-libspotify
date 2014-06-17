@@ -26,6 +26,7 @@ import "C"
 
 import (
 	"errors"
+	"fmt"
 	"net/url"
 	"runtime"
 	"strings"
@@ -162,6 +163,8 @@ type Session struct {
 	loggedIn         chan error
 	loggedOut        chan struct{}
 
+	endOfTrack chan struct{}
+
 	wg      sync.WaitGroup
 	stop    chan struct{}
 	dealloc sync.Once
@@ -189,8 +192,10 @@ func NewSession(config *Config) (*Session, error) {
 		states:           make(chan struct{}, 1),
 		loggedIn:         make(chan error, 1),
 		loggedOut:        make(chan struct{}, 1),
+		endOfTrack:       make(chan struct{}, 1),
 
 		audioConsumer: config.AudioConsumer,
+		stop:          make(chan struct{}, 100),
 	}
 
 	if err := session.setupConfig(config); err != nil {
@@ -204,7 +209,7 @@ func NewSession(config *Config) (*Session, error) {
 	// AFAIK this is the only way we can decide which thread a given goroutine
 	// executes on.
 	errc := make(chan error, 1)
-	go func() {
+	go func() { // this go routine is stopped when s.Close() is called.
 		// TODO make sure we have enough threads available
 		runtime.LockOSThread()
 
@@ -304,6 +309,7 @@ func (s *Session) free() {
 // This call releases the session internally back to libspotify and shuts the
 // background processing thread down.
 func (s *Session) Close() error {
+
 	var err error
 	s.dealloc.Do(func() {
 		err = spError(C.sp_session_release(s.sp_session))
@@ -313,6 +319,7 @@ func (s *Session) Close() error {
 
 		s.free()
 	})
+	panic("here")
 	return nil
 }
 
@@ -709,6 +716,12 @@ func (s *Session) LogoutUpdates() <-chan struct{} {
 	return s.loggedOut
 }
 
+// EndOfTrack returns a channel used to get notifed when the track
+// is about to stop playing
+func (s *Session) EndOfTrack() <-chan struct{} {
+	return s.endOfTrack
+}
+
 type SearchType C.sp_search_type
 
 const (
@@ -790,6 +803,7 @@ func (s *Session) processEvents() {
 		s.mu.Lock()
 		rc := C.sp_session_process_events(s.sp_session, &nextTimeoutMs)
 		s.mu.Unlock()
+
 		if err := spError(rc); err != nil {
 			println("process error err", err)
 			continue
@@ -825,7 +839,7 @@ func (s *Session) processBackground() {
 			}
 		case <-s.stop:
 			// TODO flush all messages
-			break
+			return
 		}
 	}
 }
@@ -935,7 +949,13 @@ func (s *Session) cbLogMessage(message string) {
 }
 
 func (s *Session) cbEndOfTrack() {
-	println("end of track")
+	//println("end of track")
+	select {
+	case s.endOfTrack <- struct{}{}:
+	default:
+		println("failed to send end of track event.")
+	}
+
 }
 
 func (s *Session) cbStreamingError(err error) {
@@ -1058,6 +1078,7 @@ func go_log_message(spSession unsafe.Pointer, message *C.char) {
 
 //export go_end_of_track
 func go_end_of_track(spSession unsafe.Pointer) {
+	//println("GO end of track")
 	sessionCall(spSession, (*Session).cbEndOfTrack)
 }
 
@@ -1264,13 +1285,13 @@ func (pc *PlaylistContainer) Owner() (*User, error) {
 }
 
 // TODO rename to Entries?
-func (pc *PlaylistContainer) Playlists() int {
+func (pc *PlaylistContainer) PlaylistsCount() int {
 	return int(C.sp_playlistcontainer_num_playlists(pc.sp_playlistcontainer))
 }
 
 // TODO rename to EntryType?
 func (pc *PlaylistContainer) PlaylistType(n int) PlaylistType {
-	if n < 0 || n >= pc.Playlists() {
+	if n < 0 || n >= pc.PlaylistsCount() {
 		panic("spotify: playlist out of range")
 	}
 	return PlaylistType(C.sp_playlistcontainer_playlist_type(pc.sp_playlistcontainer, C.int(n)))
@@ -1307,6 +1328,21 @@ func (pc *PlaylistContainer) Playlist(n int) *Playlist {
 	return newPlaylist(pc.session, sp_playlist, false)
 }
 
+//convenience function to get the playlists
+func (pc *PlaylistContainer) GetAllPlaylists() []*Playlist {
+	num_plists := pc.PlaylistsCount()
+	plists := make([]*Playlist, 0)
+
+	for i := 0; i < num_plists; i++ {
+		entry_type := pc.PlaylistType(i)
+		if entry_type == PlaylistTypePlaylist {
+			entry := pc.Playlist(i)
+			plists = append(plists, entry)
+		}
+	}
+	return plists
+}
+
 func (pc *PlaylistContainer) isLoaded() bool {
 	return C.sp_playlistcontainer_is_loaded(pc.sp_playlistcontainer) == 1
 }
@@ -1316,7 +1352,7 @@ func (pc *PlaylistContainer) Wait() {
 }
 
 func (pc *PlaylistContainer) cbLoaded() {
-	println("playlist container loaded")
+	//println("playlist container loaded")
 	select {
 	case pc.loaded <- struct{}{}:
 		pc.wg.Done()
@@ -1325,13 +1361,13 @@ func (pc *PlaylistContainer) cbLoaded() {
 
 //export go_playlistcontainer_playlist_added
 func go_playlistcontainer_playlist_added(sp_playlistcontainer unsafe.Pointer, sp_playlist unsafe.Pointer, position C.int, userdata unsafe.Pointer) {
-	println("playlist container playlist added")
+	//println("playlist container playlist added")
 }
 
 //export go_playlistcontainer_loaded
 func go_playlistcontainer_loaded(sp_playlistcontainer unsafe.Pointer, userdata unsafe.Pointer) {
-	// playlistContainerCall(spSession, (*PlaylistContainer).cbLoaded)
-	println("playlistcontainer loaded")
+	//playlistContainerCall(spSession, (*PlaylistContainer).cbLoaded)
+	//println("playlistcontainer loaded")
 	(*PlaylistContainer)(userdata).cbLoaded()
 }
 
@@ -1793,6 +1829,21 @@ func (t *Track) Index() int {
 	return int(C.sp_track_index(t.sp_track))
 }
 
+func (t *Track) String() string {
+	t.Wait()
+
+	var artists []string
+	for i := 0; i < t.Artists(); i++ {
+		artists = append(artists, t.Artist(i).Name())
+	}
+	return fmt.Sprintf("♫ %s ❂ %s ♪ %s ",
+		//track.Link(),
+		strings.Join(artists, ", "),
+		t.Album().Name(),
+		t.Name(),
+	)
+}
+
 // TODO sp_localtrack_create
 
 type TrackAvailability C.sp_track_availability
@@ -2227,6 +2278,24 @@ func (p *Playlist) SetOffline(o bool) {
 func (p *Playlist) Offline() PlaylistOfflineStatus {
 	s := C.sp_playlist_get_offline_status(p.session.sp_session, p.sp_playlist)
 	return PlaylistOfflineStatus(s)
+}
+
+func (p *Playlist) GetAllTracks() []*Track {
+	tracks := make([]*Track, p.Tracks())
+
+	for i := 0; i < p.Tracks(); i++ {
+		tracks[i] = p.Track(i).Track()
+		tracks[i].Wait()
+	}
+
+	return tracks
+}
+
+func (p *Playlist) String() string {
+	p.Wait()
+	return fmt.Sprintf("♫ %s",
+		p.Name(),
+	)
 }
 
 type PlaylistOfflineStatus C.sp_playlist_offline_status
