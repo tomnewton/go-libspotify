@@ -195,7 +195,7 @@ func NewSession(config *Config) (*Session, error) {
 		endOfTrack:       make(chan struct{}, 1),
 
 		audioConsumer: config.AudioConsumer,
-		stop:          make(chan struct{}, 100),
+		stop:          make(chan struct{}, 1),
 	}
 
 	if err := session.setupConfig(config); err != nil {
@@ -309,17 +309,23 @@ func (s *Session) free() {
 // This call releases the session internally back to libspotify and shuts the
 // background processing thread down.
 func (s *Session) Close() error {
-
 	var err error
 	s.dealloc.Do(func() {
-		err = spError(C.sp_session_release(s.sp_session))
 
 		s.events <- eStop
+
+		s.stop <- struct{}{} //stops the processBackground loop
+
 		s.wg.Wait()
+
+		err = spError(C.sp_session_release(s.sp_session))
+		if err != nil {
+			println("ERROR!!!")
+		}
 
 		s.free()
 	})
-	panic("here")
+
 	return nil
 }
 
@@ -813,7 +819,9 @@ func (s *Session) processEvents() {
 		select {
 		case <-time.After(timeout):
 		case evt := <-s.events:
+			println("processing event...")
 			if evt == eStop {
+				println("eStop on processEvents()")
 				return
 			}
 		}
@@ -839,6 +847,7 @@ func (s *Session) processBackground() {
 			}
 		case <-s.stop:
 			// TODO flush all messages
+			println("estop on processBackground()")
 			return
 		}
 	}
