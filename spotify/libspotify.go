@@ -27,8 +27,11 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	logger "github.com/tomnewton/spotiline/logging"
+	"github.com/tomnewton/spotiline/sdl"
 	"net/url"
 	"runtime"
+	_ "runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -209,9 +212,19 @@ func NewSession(config *Config) (*Session, error) {
 	// AFAIK this is the only way we can decide which thread a given goroutine
 	// executes on.
 	errc := make(chan error, 1)
-	go func() { // this go routine is stopped when s.Close() is called.
+
+	sdl.Do(func() {
+		err := spError(C.sp_session_create(&session.config, &session.sp_session))
+		errc <- err
+		if err != nil {
+			panic("Could not create session!")
+		}
+	})
+
+	go session.processEvents()
+
+	/*go func() { // this go routine is stopped when s.Close() is called.
 		// TODO make sure we have enough threads available
-		runtime.LockOSThread()
 
 		err := spError(C.sp_session_create(&session.config, &session.sp_session))
 		errc <- err
@@ -219,7 +232,7 @@ func NewSession(config *Config) (*Session, error) {
 			return
 		}
 		session.processEvents()
-	}()
+	}()*/
 
 	if err := <-errc; err != nil {
 		return nil, err
@@ -309,18 +322,28 @@ func (s *Session) free() {
 // This call releases the session internally back to libspotify and shuts the
 // background processing thread down.
 func (s *Session) Close() error {
+	logger.Debug.Println("Session.Close()")
+
+	logger.Debug.Println("sending eStop to events..")
+	s.events <- eStop
+
+	logger.Debug.Println("sending s.stop to stop processBackground loop")
+	s.stop <- struct{}{} //stops the processBackground loop
+
+	logger.Debug.Println("1")
+	s.wg.Wait()
+	logger.Debug.Println("2")
+
 	var err error
+	if err != nil {
+		panic("Error logging out.")
+	}
+
 	s.dealloc.Do(func() {
-
-		s.events <- eStop
-
-		s.stop <- struct{}{} //stops the processBackground loop
-
-		s.wg.Wait()
 
 		err = spError(C.sp_session_release(s.sp_session))
 		if err != nil {
-			println("ERROR!!!")
+			logger.Debug.Println("ERROR!!!")
 		}
 
 		s.free()
@@ -353,13 +376,15 @@ func (s *Session) Login(c Credentials, remember bool) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	rc := C.sp_session_login(
-		s.sp_session,
-		cusername,
-		cpassword,
-		crememberme,
-		cblob,
-	)
+			s.sp_session,
+			cusername,
+			cpassword,
+			crememberme,
+			cblob,
+		)
+
 	return spError(rc)
 }
 
@@ -806,23 +831,37 @@ func (s *Session) processEvents() {
 	defer s.wg.Done()
 
 	for {
+		logger.Debug.Println("Locking...")
 		s.mu.Lock()
-		rc := C.sp_session_process_events(s.sp_session, &nextTimeoutMs)
+		logger.Debug.Println("Locked")
+		var rc C.sp_error
+
+		sdl.Do(func() {
+			rc = C.sp_session_process_events(s.sp_session, &nextTimeoutMs)
+		})
+
+		logger.Debug.Println("Unlocking...")
 		s.mu.Unlock()
+		logger.Debug.Println("Unlocked")
 
 		if err := spError(rc); err != nil {
-			println("process error err", err)
+			logger.Error.Println("process error err", err)
 			continue
 		}
 
 		timeout := time.Duration(nextTimeoutMs) * time.Millisecond
+
 		select {
 		case <-time.After(timeout):
+			logger.Debug.Println("Timeout elapsed.")
 		case evt := <-s.events:
-			println("processing event...")
+			logger.Debug.Println("processing event... ", len(s.events))
+
 			if evt == eStop {
-				println("eStop on processEvents()")
+				logger.Debug.Println("eStop on processEvents()")
 				return
+			} else {
+				logger.Debug.Println("event: ", evt)
 			}
 		}
 	}
@@ -847,7 +886,7 @@ func (s *Session) processBackground() {
 			}
 		case <-s.stop:
 			// TODO flush all messages
-			println("estop on processBackground()")
+			logger.Debug.Println("estop on processBackground()")
 			return
 		}
 	}
@@ -902,7 +941,7 @@ func (s *Session) cbLoggedIn(err error) {
 	select {
 	case s.loggedIn <- err:
 	default:
-		println("failed to send logged in event")
+		logger.Debug.Println("failed to send logged in event")
 	}
 }
 
@@ -910,7 +949,7 @@ func (s *Session) cbLoggedOut() {
 	select {
 	case s.loggedOut <- struct{}{}:
 	default:
-		println("failed to send logged out event")
+		logger.Debug.Println("failed to send logged out event")
 	}
 }
 
@@ -919,21 +958,23 @@ func (s *Session) cbMetadataUpdated() {
 }
 
 func (s *Session) cbConnectionError(err error) {
-	println("connection errror called", s, err)
+	logger.Debug.Println("connection errror called", s, err)
 }
 
 func (s *Session) cbMessageToUser(message string) {
 	// TODO
-	println("message to user", message)
+	logger.Debug.Println("message to user", message)
 }
 
 func (s *Session) cbNotifyMainThread() {
+	logger.Debug.Println("wakeup")
 	select {
 	case s.events <- eWakeup:
 	default:
-		println("failed to notify main thread")
+		logger.Error.Println("failed to notify main thread")
 		// TODO generate (internal) log message
 	}
+	logger.Debug.Println("wakeup-done")
 }
 
 // cbMusicDelivery is called when there is decompressed audio data available.
@@ -947,7 +988,7 @@ func (s *Session) cbMusicDelivery(format AudioFormat, frames []byte) int {
 
 func (s *Session) cbPlayTokenLost() {
 	// TODO
-	println("play token lost")
+	logger.Debug.Println("play token lost")
 }
 
 func (s *Session) cbLogMessage(message string) {
@@ -958,17 +999,17 @@ func (s *Session) cbLogMessage(message string) {
 }
 
 func (s *Session) cbEndOfTrack() {
-	//println("end of track")
+	//logger.Debug.Println("end of track")
 	select {
 	case s.endOfTrack <- struct{}{}:
 	default:
-		println("failed to send end of track event.")
+		logger.Debug.Println("failed to send end of track event.")
 	}
 
 }
 
 func (s *Session) cbStreamingError(err error) {
-	println("streaming error", err.Error())
+	logger.Debug.Println("streaming error", err.Error())
 }
 
 func (s *Session) cbUserInfoUpdated() {
@@ -976,23 +1017,23 @@ func (s *Session) cbUserInfoUpdated() {
 }
 
 func (s *Session) cbStartPlayback() {
-	println("start playback")
+	logger.Debug.Println("start playback")
 }
 
 func (s *Session) cbStopPlayback() {
-	println("stop playback")
+	logger.Debug.Println("stop playback")
 }
 
 func (s *Session) cbGetAudioBufferStats() {
-	println("get audio buffer stats")
+	logger.Debug.Println("get audio buffer stats")
 }
 
 func (s *Session) cbOfflineStatusUpdated() {
-	println("offline status updated")
+	logger.Debug.Println("offline status updated")
 }
 
 func (s *Session) cbOfflineError(err error) {
-	println("offline error", err.Error())
+	logger.Debug.Println("offline error", err.Error())
 }
 
 func (s *Session) cbCredentialsBlobUpdated(blob []byte) {
@@ -1010,11 +1051,11 @@ func (s *Session) cbConnectionStateUpdated() {
 }
 
 func (s *Session) cbScrobbleError(err error) {
-	println("scrobble error", err.Error())
+	logger.Debug.Println("scrobble error", err.Error())
 }
 
 func (s *Session) cbPrivateSessionModeChanged(private bool) {
-	println("private mode changed", private)
+	logger.Debug.Println("private mode changed", private)
 }
 
 //export go_logged_in
@@ -1087,7 +1128,7 @@ func go_log_message(spSession unsafe.Pointer, message *C.char) {
 
 //export go_end_of_track
 func go_end_of_track(spSession unsafe.Pointer) {
-	//println("GO end of track")
+	//logger.Debug.Println("GO end of track")
 	sessionCall(spSession, (*Session).cbEndOfTrack)
 }
 
@@ -1361,7 +1402,7 @@ func (pc *PlaylistContainer) Wait() {
 }
 
 func (pc *PlaylistContainer) cbLoaded() {
-	//println("playlist container loaded")
+	//logger.Debug.Println("playlist container loaded")
 	select {
 	case pc.loaded <- struct{}{}:
 		pc.wg.Done()
@@ -1370,13 +1411,13 @@ func (pc *PlaylistContainer) cbLoaded() {
 
 //export go_playlistcontainer_playlist_added
 func go_playlistcontainer_playlist_added(sp_playlistcontainer unsafe.Pointer, sp_playlist unsafe.Pointer, position C.int, userdata unsafe.Pointer) {
-	//println("playlist container playlist added")
+	//logger.Debug.Println("playlist container playlist added")
 }
 
 //export go_playlistcontainer_loaded
 func go_playlistcontainer_loaded(sp_playlistcontainer unsafe.Pointer, userdata unsafe.Pointer) {
 	//playlistContainerCall(spSession, (*PlaylistContainer).cbLoaded)
-	//println("playlistcontainer loaded")
+	//logger.Debug.Println("playlistcontainer loaded")
 	(*PlaylistContainer)(userdata).cbLoaded()
 }
 
@@ -1538,7 +1579,7 @@ type search struct {
 
 func newSearch(session *Session, query string, opts *SearchOptions) (*search, error) {
 	s := &search{session: session}
-	s.wg.Add(1)
+	//s.wg.Add(1) //TODO: remove this commented out wg.Add(1) call.
 
 	cquery := C.CString(query)
 	defer C.free(unsafe.Pointer(cquery))
@@ -2459,12 +2500,12 @@ func (t *toplist) release() {
 }
 
 func (t *toplist) cbComplete() {
-	println("toplist done", t)
+	logger.Debug.Println("toplist done", t)
 	t.wg.Done()
 }
 
 func (t *toplist) Wait() {
-	println("waiting for toplist", t)
+	logger.Debug.Println("waiting for toplist", t)
 	t.wg.Wait()
 }
 
